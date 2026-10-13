@@ -1,26 +1,19 @@
 //
 //	画面構成 (320x240 横):
-//	  y   0..26  ステータス行 (US/JP / TONE / SETUP ボタン / xxWPM / 時計 HH:MM:SS)
+//	  y   0..26  ステータス行 (US/JP / SPEED / トーン表示)
 //	  y  28..171 デコード文字エリア 16列 x 6行 (24x24 全角フォント、ピッチ20px)
 //	  y 173..239 左: FFTスペクトラム(PK表示) / 右: オシロスコープ(波形ON/OFFボタン)
 //	オシロは生波形(min/maxバンド)・トーンエンベロープ・キー判定を
-//	同一時間軸(1列=WPM追従の数hop)で色分け重畳する。
-//	文字エリア中央付近のタップで時計画面へ切り替わる (main.cpp)。
-//	時計表示中は visible=0 で描画を止め、受信文字はグリッドに溜める。
+//	同一時間軸(1列=6ms)で色分け重畳する。
 //
 #include <Arduino.h>
 #include <string.h>
-#include <math.h>
 #include "lgfx_config.h"
 #include "display.h"
 #include "decoder.h"
 #include "decode.h"
 #include "dsp.h"
 #include "audio.h"
-#include "version.h"
-#include "clock.h"
-#include "scopelog.h"
-#include "touchcal.h"
 
 #define STATUS_H 27
 #define TEXT_TOP 28
@@ -36,21 +29,6 @@
 #define PANEL_H 67
 #define PANEL_W 160
 #define SCOPE_COLS 150
-// 下段パネルの全幅表示。波形部分をダブルタップすると、そのパネルが
-// 横幅いっぱい (320px) になり、もう一度ダブルタップで戻る。
-// 広げている間はもう一方を描かず、スプライトのバッファもそちらへ回す。
-// 掃引レートや周波数レンジは変えないので、見える量がそのまま 2 倍になる。
-// FFT のシングルタップ (トーン選択) は従来どおり残す
-#define PANEL_WIDE_NONE  0
-#define PANEL_WIDE_FFT   1
-#define PANEL_WIDE_SCOPE 2
-#define SCOPE_COLS_WIDE 310
-static uint8_t panel_wide = PANEL_WIDE_NONE;
-// 現在のパネル幅 (描画・タッチ判定の両方で使う)
-static inline int panel_w(uint8_t which)
-{
-	return (panel_wide == which) ? 320 : PANEL_W;
-}
 
 // カラーパレット
 #define C_STATUS_BG lgfx::color565(8, 20, 45)
@@ -67,9 +45,6 @@ static inline int panel_w(uint8_t which)
 #define C_LABEL     lgfx::color565(100, 125, 155)
 #define C_EQ_FILL   lgfx::color565(8, 65, 50)
 #define C_EQ_LINE   lgfx::color565(60, 230, 160)
-#define C_LVL_LO    lgfx::color565(45, 200, 120)   // 入力レベル: 適正
-#define C_LVL_MID   lgfx::color565(230, 180, 60)   // 入力レベル: やや高
-#define C_LVL_HI    lgfx::color565(235, 70, 60)    // 入力レベル: クリップ注意
 #define C_EQ_PEAK   lgfx::color565(210, 215, 225)
 #define C_MARKER    lgfx::color565(50, 75, 130)
 #define C_BAND      lgfx::color565(10, 24, 42)
@@ -78,6 +53,9 @@ static inline int panel_w(uint8_t which)
 #define C_ENV       lgfx::color565(250, 199, 117)
 #define C_GATE      lgfx::color565(90, 220, 120)
 #define C_GATE_OFF  lgfx::color565(35, 55, 45)
+#define C_LVL_LO    lgfx::color565(50, 205, 105)
+#define C_LVL_MID   lgfx::color565(250, 199, 55)
+#define C_LVL_HI    lgfx::color565(245, 60, 45)
 // ボタン統一スタイル (ON/OFF)
 #define C_BTN_BG     lgfx::color565(18, 45, 80)
 #define C_BTN_BD     lgfx::color565(90, 150, 210)
@@ -95,18 +73,15 @@ static LGFX_Sprite fft_spr(&lcd);
 static LGFX_Sprite scope_spr(&lcd);
 static LGFX_Sprite status_spr(&lcd);
 
-static QueueHandle_t char_queue;
+#define CHAR_QUEUE_SIZE 128
+static uint8_t char_queue[CHAR_QUEUE_SIZE];
+static uint8_t char_q_head = 0;
+static uint8_t char_q_tail = 0;
 
-// スコープ上に流すデコード文字: 文字とデコード時点のスコープ列番号。
-// DSP タスク (display_enqueue) が書き、表示側が読む単一生産者/消費者リング
 #define TICKER_N 48
 typedef struct { uint8_t ch; uint32_t col; } ticker_t;
 static ticker_t ticker[TICKER_N];
-static volatile uint8_t ticker_head = 0;
-static uint8_t visible = 1;             // 0=他画面表示中 (描画抑止)
-static uint8_t status_dirty = 1;        // 1=ステータス行を強制描画
-static void (*center_tap_fn)(void) = NULL;
-static void (*setup_tap_fn)(void) = NULL;
+static uint8_t ticker_head = 0;
 
 static uint16_t grid[TEXT_ROWS][TEXT_COLS];
 static uint8_t cur_row = 0;
@@ -170,6 +145,15 @@ static int utf8_encode(uint16_t cp, char *out)
 	return 3;
 }
 
+static uint16_t codepoint_of(uint8_t ch)
+{
+	if (ch == 5) return 0x300C;
+	if (ch == 6) return 0x300D;
+	if (ch >= 0xA1 && ch <= 0xDF) return kana_cp[ch - 0xA1];
+	if (ch < 0x80) return ch;
+	return '*';
+}
+
 //==================================================================
 //	デコード文字エリア
 //==================================================================
@@ -179,7 +163,6 @@ static void draw_cell(uint8_t r, uint8_t c, uint16_t color)
 	int y = TEXT_TOP + r * CELL_H;
 	uint16_t cp = grid[r][c];
 
-	if (!visible) return;
 	lcd.fillRect(x, y, CELL_W, CELL_H, TFT_BLACK);
 	if (cp == ' ' || cp == 0) return;
 
@@ -199,13 +182,11 @@ static void draw_cursor(uint8_t r, uint8_t c, uint8_t on)
 {
 	int x = TEXT_X0 + c * CELL_W;
 	int y = TEXT_TOP + r * CELL_H + CELL_H - 2;
-	if (!visible) return;
 	lcd.fillRect(x + 2, y, CELL_W - 4, 2, on ? C_CURSOR : TFT_BLACK);
 }
 
 static void redraw_text_area(void)
 {
-	if (!visible) return;
 	lcd.startWrite();
 	for (uint8_t r = 0; r < TEXT_ROWS; r++) {
 		for (uint8_t c = 0; c < TEXT_COLS; c++) {
@@ -272,16 +253,6 @@ static void text_putcp(uint16_t cp)
 	}
 }
 
-// デコーダの出力バイト → Unicode コードポイント
-static uint16_t codepoint_of(uint8_t ch)
-{
-	if (ch == 5) return 0x300C;                 // ホレ (和文開始) → 「
-	if (ch == 6) return 0x300D;                 // ラタ (和文終了) → 」
-	if (ch >= 0xA1 && ch <= 0xDF) return kana_cp[ch - 0xA1];
-	if (ch < 0x80) return ch;
-	return '*';
-}
-
 static void text_putchar(uint8_t ch)
 {
 	uint16_t cp = codepoint_of(ch);
@@ -309,7 +280,7 @@ static void text_putchar(uint8_t ch)
 //==================================================================
 //	ステータス行
 //==================================================================
-// スコープ波形の表示ON/OFF (タッチで切替、デフォルト全ON)
+// スコープ波形の表示ON/OFF (プッシュスイッチで切替、デフォルト全ON)
 static uint8_t show_key = 1;
 static uint8_t show_env = 1;
 static uint8_t show_raw = 1;
@@ -338,35 +309,22 @@ static void draw_panel_button(LGFX_Sprite *spr, int x, int y, int w, int h,
 	                on ? C_BTN_TX : C_BTN_OFF_TX);
 }
 
-// ステータス行のレイアウト: [US/JP] [TONE] [SETUP] xxWPM ... HH:MM:SS
-#define ST_BTN_W 64
-#define ST_BTN_H 23
-#define ST_MODE_X 2
-#define ST_TONE_X 68
-#define ST_SETUP_X 134
-#define ST_WPM_X 204
-#define ST_CLOCK_RIGHT 318        // 時計の右端
-
 static void draw_status(void)
 {
 	static uint16_t s_wpm = 0xFFFF;
 	static uint8_t s_mode = 0xFF;
 	static uint8_t s_tone = 0xFF;
 	static uint16_t s_thz = 0xFFFF;
-	static uint32_t s_sec = 0xFFFFFFFF;
 
 	uint16_t wpm = decoder_wpm();
 	uint8_t mode = decoder_mode();
 	uint8_t tone = dsp_tone_index();
 	uint16_t thz = dsp_tone_hz();
-	uint32_t now = clock_zone_now(clock_zone());   // 選択中の国の時刻
 
-	if (!status_dirty && now == s_sec &&
-	    wpm == s_wpm && mode == s_mode && tone == s_tone && thz == s_thz) {
+	if (wpm == s_wpm && mode == s_mode && tone == s_tone && thz == s_thz) {
 		return;
 	}
-	status_dirty = 0;
-	s_wpm = wpm; s_mode = mode; s_tone = tone; s_thz = thz; s_sec = now;
+	s_wpm = wpm; s_mode = mode; s_tone = tone; s_thz = thz;
 
 	char buf[24];
 	status_spr.fillSprite(C_STATUS_BG);
@@ -374,41 +332,32 @@ static void draw_status(void)
 
 	// US/JP モード切替ボタン (横長、モードで色分け)
 	if (mode == MODE_US) {
-		draw_panel_button(&status_spr, ST_MODE_X, 2, ST_BTN_W, ST_BTN_H, "US", 1);
+		draw_panel_button(&status_spr, 2, 2, 64, 23, "US", 1);
 	} else {
-		draw_button_col(&status_spr, ST_MODE_X, 2, ST_BTN_W, ST_BTN_H, "JP",
+		draw_button_col(&status_spr, 2, 2, 64, 23, "JP",
 		                C_BTNJP_BG, C_BTNJP_BD, C_BTNJP_TX);
 	}
 
-	// トーン切替ボタン: AUTO → 600 → 700 → 800 → 900 → 1000 の順送り
-	if (dsp_tone_is_auto()) {
-		draw_button_col(&status_spr, ST_TONE_X, 2, ST_BTN_W, ST_BTN_H, "AUTO",
-		                C_BTN_BG, C_BTN_BD, C_GATE);
-	} else {
-		snprintf(buf, sizeof(buf), "%u", (unsigned)thz);
-		draw_panel_button(&status_spr, ST_TONE_X, 2, ST_BTN_W, ST_BTN_H, buf, 1);
-	}
-
-	// SETUP ボタン (時刻合わせ / OTA / WiFi設定 / スコープログ)
-	draw_panel_button(&status_spr, ST_SETUP_X, 2, ST_BTN_W, ST_BTN_H, "SETUP", 1);
-
 	// 速度表示
-	status_spr.setFont(&fonts::AsciiFont8x16);
 	status_spr.setTextColor(C_WPM);
-	status_spr.setCursor(ST_WPM_X, 6);
-	snprintf(buf, sizeof(buf), "%2dWPM", wpm);
+	status_spr.setCursor(74, 6);
+	snprintf(buf, sizeof(buf), "SPEED:%2dWPM", wpm);
 	status_spr.print(buf);
 
-	// 時計 HH:MM:SS (右端、SPEED と同じ AsciiFont8x16)
-	{
-		clock_tm_t tm;
-		clock_break(now, &tm);
-		snprintf(buf, sizeof(buf), "%02u:%02u:%02u", tm.hour, tm.min, tm.sec);
-		status_spr.setFont(&fonts::AsciiFont8x16);
-		status_spr.setTextColor(C_STATUS_TX);
-		status_spr.setCursor(ST_CLOCK_RIGHT - 8 * 8, 6);
-		status_spr.print(buf);
+	// トーン切替: < [AUTO/600/700/800/900/1000] >
+	draw_panel_button(&status_spr, 166, 2, 28, 23, "<", 1);
+	draw_panel_button(&status_spr, 196, 2, 92, 23, "", 1);
+	if (dsp_tone_is_auto()) {
+		status_spr.setTextColor(C_GATE);
+		snprintf(buf, sizeof(buf), "AUTO");
+	} else {
+		status_spr.setTextColor(C_BTN_TX);
+		snprintf(buf, sizeof(buf), "%u", (unsigned)thz);
 	}
+	status_spr.setFont(&fonts::AsciiFont8x16);
+	status_spr.setCursor(196 + (92 - (int)strlen(buf) * 8) / 2, 6);
+	status_spr.print(buf);
+	draw_panel_button(&status_spr, 290, 2, 28, 23, ">", 1);
 
 	status_spr.pushSprite(0, 0);
 }
@@ -420,28 +369,16 @@ static void draw_status(void)
 //==================================================================
 #define EQ_BAR_COUNT 29          // 1点 = 1bin (31.25Hz)、bin10〜38
 #define EQ_BIN_START 10          // 312.5Hz
-#define EQ_BAR_PITCH 5           // 5px/bin (全幅表示では 2 倍)
+#define EQ_BAR_PITCH 5           // 5px/bin
 #define EQ_X0 6
 #define EQ_BASE_Y 54
 #define EQ_PLOT_H 42
 #define EQ_F_MIN 312.5f          // bin10 の中心周波数
-
-// 全幅表示ではピッチと左端を 2 倍にして横幅いっぱいに広げる。
-// 周波数レンジは変えないので、目盛りの間隔だけが広がる
-static inline int eq_pitch(void)  { return (panel_wide == PANEL_WIDE_FFT) ? EQ_BAR_PITCH * 2 : EQ_BAR_PITCH; }
-static inline int eq_x0(void)     { return (panel_wide == PANEL_WIDE_FFT) ? EQ_X0 * 2 : EQ_X0; }
-static inline float eq_hz_per_px(void) { return 31.25f / (float)eq_pitch(); }
-#define EQ_HZ_PER_PX (eq_hz_per_px())
+#define EQ_HZ_PER_PX (31.25f / (float)EQ_BAR_PITCH)
 
 static int eq_x_of_hz(float f)
 {
-	return eq_x0() + (int)((f - EQ_F_MIN) / eq_hz_per_px() + 0.5f);
-}
-
-//	パネル内の x 座標 → 周波数 (タッチのトーン選択用)
-static float eq_hz_of_x(int x)
-{
-	return EQ_F_MIN + (float)(x - eq_x0()) * eq_hz_per_px();
+	return EQ_X0 + (int)((f - EQ_F_MIN) / EQ_HZ_PER_PX + 0.5f);
 }
 
 static void draw_fft_panel(void)
@@ -466,10 +403,8 @@ static void draw_fft_panel(void)
 	disp_max += (fmax * 1.15f - disp_max) * 0.05f;
 	if (disp_max < 8000.0f) disp_max = 8000.0f;
 
-	const int pw = panel_w(PANEL_WIDE_FFT);
-	const int px0 = eq_x0(), ppitch = eq_pitch();
 	fft_spr.fillSprite(C_PANEL_BG);
-	fft_spr.drawRect(0, 0, pw, PANEL_H, C_FRAME);
+	fft_spr.drawRect(0, 0, PANEL_W, PANEL_H, C_FRAME);
 
 	// TONE選択レンジ(600〜1000Hz)のガイド帯 + 境界線
 	{
@@ -480,7 +415,7 @@ static void draw_fft_panel(void)
 		fft_spr.drawFastVLine(x_hi, plot_top - 2, plot_h + 4, C_MARKER);
 	}
 
-	// 選択中トーンの検出帯域 (Goertzel 1ビン幅、WPM追従で±34/±68Hz) を
+	// 選択中トーンの検出帯域 (Goertzel 1ビン幅、WPM追従で±42/±83Hz) を
 	// 帯で表示。AUTO時は追従先へスライドする
 	{
 		const float half_bw = (float)dsp_gate_bw_hz() * 0.5f;
@@ -516,9 +451,9 @@ static void draw_fft_panel(void)
 		}
 		// 塗り (点間は線形補間)
 		for (int b = 0; b < EQ_BAR_COUNT - 1; b++) {
-			int x = px0 + b * ppitch;
-			for (int dx = 0; dx < ppitch; dx++) {
-				int yy = y_pt[b] + ((y_pt[b + 1] - y_pt[b]) * dx) / ppitch;
+			int x = EQ_X0 + b * EQ_BAR_PITCH;
+			for (int dx = 0; dx < EQ_BAR_PITCH; dx++) {
+				int yy = y_pt[b] + ((y_pt[b + 1] - y_pt[b]) * dx) / EQ_BAR_PITCH;
 				if (yy < EQ_BASE_Y) {
 					fft_spr.drawFastVLine(x + dx, yy, EQ_BASE_Y - yy, C_EQ_FILL);
 				}
@@ -526,14 +461,14 @@ static void draw_fft_panel(void)
 		}
 		// エンベロープライン
 		for (int b = 0; b < EQ_BAR_COUNT - 1; b++) {
-			int x = px0 + b * ppitch;
-			fft_spr.drawLine(x, y_pt[b], x + ppitch, y_pt[b + 1], C_EQ_LINE);
+			int x = EQ_X0 + b * EQ_BAR_PITCH;
+			fft_spr.drawLine(x, y_pt[b], x + EQ_BAR_PITCH, y_pt[b + 1], C_EQ_LINE);
 		}
 		// ピークホールド (bin毎の白マーカー)
 		for (int b = 0; b < EQ_BAR_COUNT; b++) {
 			if (peak_px[b] > 1.0f) {
-				int x = px0 + b * ppitch - 1;
-				if (x < px0) x = px0;
+				int x = EQ_X0 + b * EQ_BAR_PITCH - 1;
+				if (x < EQ_X0) x = EQ_X0;
 				fft_spr.drawFastHLine(x, EQ_BASE_Y - (int)(peak_px[b] + 0.5f), 3, C_EQ_PEAK);
 			}
 		}
@@ -566,44 +501,37 @@ static void draw_fft_panel(void)
 		fft_spr.setCursor(4, 3);
 		fft_spr.print("FFT");
 		fft_spr.setTextColor(C_GATE);
-		fft_spr.setCursor(pw - 4 - (int)strlen(pkbuf) * 6, 3);
+		fft_spr.setCursor(PANEL_W - 4 - (int)strlen(pkbuf) * 6, 3);
 		fft_spr.print(pkbuf);
 
-		// 入力レベルメーター (dB スケール、LVL_DB_MIN〜0 dBFS を全幅)。
-		// 0 dBFS = ADC 半スイング 2048 カウント ≈ 1.55V ピーク。実運用の入力は
-		// 0.1V ピーク程度 (-24 dBFS) で、リニア表示だと数%しか振れないため
-		// 対数にする。ESP32 の ADC は 12dB 減衰でも約2.45V から非線形になる
-		// ので、1.65V バイアスの正側は +0.85V ≈ -5 dBFS までが直線範囲
-		// (黄の目盛)。-2.5 dBFS 以上は赤。ADC レール到達で "CLIP" を 0.5 秒点灯
+		// 入力レベルは小信号も見やすいdBFS表示。黄色の目盛を超えると
+		// ADC上限が近く、レール到達を検出した場合は0.5秒間CLIPを表示する。
 		{
-			const int bx = 28, by = 2, bw = 54, bh = 7;
-			const float LVL_DB_MIN = -50.0f;
-			const float LVL_DB_LIN = -5.2f;      // 直線範囲の上限 (0.55 x 2048)
-			const float LVL_DB_RED = -2.5f;
+			const int bx = 28, by = 2, bw = 48, bh = 7;
+			const float db_min = -50.0f;
+			const float db_warn = -5.2f;
+			const float db_red = -2.5f;
 			int16_t pk = dsp_input_peak();
-			float db = (pk > 0) ? 20.0f * log10f((float)pk / 2048.0f) : LVL_DB_MIN;
-			if (db < LVL_DB_MIN) db = LVL_DB_MIN;
+			float db = (pk > 0) ? 20.0f * log10f((float)pk / 2048.0f) : db_min;
+			if (db < db_min) db = db_min;
 			if (db > 0.0f) db = 0.0f;
-			int fw = (int)((db - LVL_DB_MIN) / (0.0f - LVL_DB_MIN) * (float)bw + 0.5f);
-			uint16_t col = (db >= LVL_DB_RED) ? C_LVL_HI : (db >= LVL_DB_LIN) ? C_LVL_MID : C_LVL_LO;
+			int fw = (int)((db - db_min) / -db_min * (float)bw + 0.5f);
+			uint16_t col = (db >= db_red) ? C_LVL_HI : (db >= db_warn) ? C_LVL_MID : C_LVL_LO;
 			fft_spr.drawRect(bx, by, bw, bh, C_FRAME);
 			if (fw > 0) fft_spr.fillRect(bx, by, fw, bh, col);
-			// 直線範囲の上限 (-5 dBFS) の目盛
-			fft_spr.drawFastVLine(bx + (int)((LVL_DB_LIN - LVL_DB_MIN) / (0.0f - LVL_DB_MIN) * (float)bw + 0.5f),
+			fft_spr.drawFastVLine(bx + (int)((db_warn - db_min) / -db_min * (float)bw + 0.5f),
 			                      by, bh, C_LVL_MID);
 
 			static uint32_t clip_seen = 0;
 			static uint32_t clip_ms = 0;
 			uint32_t clips = audio_clip_total();
-			uint32_t now_ms = millis();
+			uint32_t now = millis();
 			if (clips != clip_seen) {
 				clip_seen = clips;
-				clip_ms = now_ms;
+				clip_ms = now;
 			}
-			if (clip_ms != 0 && (now_ms - clip_ms) < 500) {
-				// バー全体を赤にして白抜き "CLIP" (右側の Peak 表示と重ねない)
+			if (clip_ms != 0 && (now - clip_ms) < 500) {
 				fft_spr.fillRect(bx, by, bw, bh, C_LVL_HI);
-				fft_spr.setFont(&fonts::Font0);
 				fft_spr.setTextColor(TFT_WHITE);
 				fft_spr.setCursor(bx + (bw - 24) / 2, by - 1);
 				fft_spr.print("CLIP");
@@ -632,18 +560,15 @@ static void draw_fft_panel(void)
 //==================================================================
 static void draw_scope_panel(void)
 {
-	static scope_col_t cols[SCOPE_COLS_WIDE];
+	static scope_col_t cols[SCOPE_COLS];
 	static float raw_max = 100.0f;
 	static float env_max = 500.0f;
 
-	const int pw = panel_w(PANEL_WIDE_SCOPE);
-	const int ncol = (panel_wide == PANEL_WIDE_SCOPE) ? SCOPE_COLS_WIDE : SCOPE_COLS;
-	dsp_get_scope(cols, ncol);
+	dsp_get_scope(cols, SCOPE_COLS);
 
 	const int x0 = 4;
-	const int text_h = 16;                // デコード文字行 (lgfxJapanGothicP_16)
-	const int plot_top = text_h + 1;      // KEY判定バーの行 (17)
-	const int wave_top = plot_top + 8;    // 波形上限: KEYバーの下に約5px空ける (25)
+	const int plot_top = 17;              // デコード文字行の下にKEY判定バー
+	const int wave_top = plot_top + 8;    // 波形上限: KEYバーの下に約5px空ける
 	const int plot_bot = 46;
 	const int mid_y = (wave_top + plot_bot) / 2;
 	const int half_h = (plot_bot - wave_top) / 2;
@@ -652,7 +577,7 @@ static void draw_scope_panel(void)
 
 	// AGC (生波形/エンベロープ別)
 	float rmax = 0.0f, emax = 0.0f;
-	for (int i = 0; i < ncol; i++) {
+	for (int i = 0; i < SCOPE_COLS; i++) {
 		float a = (float)((cols[i].mx > -cols[i].mn) ? cols[i].mx : -cols[i].mn);
 		if (a > rmax) rmax = a;
 		if ((float)cols[i].mag > emax) emax = (float)cols[i].mag;
@@ -663,13 +588,13 @@ static void draw_scope_panel(void)
 	if (env_max < 400.0f) env_max = 400.0f;
 
 	scope_spr.fillSprite(C_PANEL_BG);
-	scope_spr.drawRect(0, 0, pw, PANEL_H, C_FRAME);
+	scope_spr.drawRect(0, 0, PANEL_W, PANEL_H, C_FRAME);
 	if (show_raw) {
-		scope_spr.drawFastHLine(x0, mid_y, ncol, lgfx::color565(20, 40, 55));
+		scope_spr.drawFastHLine(x0, mid_y, SCOPE_COLS, lgfx::color565(20, 40, 55));
 	}
 
 	int prev_ey = -1;
-	for (int i = 0; i < ncol; i++) {
+	for (int i = 0; i < SCOPE_COLS; i++) {
 		int x = x0 + i;
 
 		// 生波形 min/max バンド
@@ -699,51 +624,40 @@ static void draw_scope_panel(void)
 		}
 	}
 
-	// デコード文字を KEY バーの上に、デコードされた時点の時間軸位置で流す
-	// (掃引とともに左へ流れる)。"SCOPE" ラベルはこの行を空けるため廃止
-	if (show_key) {                 // KEY ボタンで符号バーと文字を一緒に ON/OFF
-		const uint32_t cur = dsp_scope_col_index();     // 最新列 = cur-1
-		// SETUP/時計と同じ P 付き (等幅の lgfxJapanGothic_16 は
-		// このフォントだけで Flash を 159KB 消費するため使わない)
+	// デコード文字を、その符号区間の中央位置に合わせて左へ流す。
+	if (show_key) {
+		uint32_t cur = dsp_scope_col_index();
 		scope_spr.setFont(&fonts::lgfxJapanGothicP_16);
 		scope_spr.setTextColor(C_TEXT_NEW);
-		for (int i = 0; i < TICKER_N; i++) {
+		for (int i = 0; i < TICKER_N; ++i) {
 			uint32_t col = ticker[i].col;
-			if (col == 0 || col >= cur || (cur - col) > (uint32_t)ncol + 8) continue;
-			int x = x0 + (ncol - 1) - (int)(cur - 1 - col);   // 符号区間の中央
+			if (col == 0 || col >= cur || (cur - col) > (uint32_t)SCOPE_COLS + 8) continue;
+			int x = x0 + (SCOPE_COLS - 1) - (int)(cur - 1 - col);
 			char u8[4];
 			utf8_encode(codepoint_of(ticker[i].ch), u8);
 			int w = scope_spr.textWidth(u8);
 			int tx = x - w / 2;
-			if (tx + w <= 1 || tx >= pw - 1) continue;
+			if (tx + w <= 1 || tx >= PANEL_W - 1) continue;
 			scope_spr.setCursor(tx, 0);
 			scope_spr.print(u8);
 		}
 	}
 
-	// 波形ON/OFFボタン (下段)。全幅表示にしてもスプライトの原点が
-	// 画面左端へ移るだけで、ボタンは画面上の同じ位置 (右半分) に置く
-	{
-		const int bx = (panel_wide == PANEL_WIDE_SCOPE) ? PANEL_W : 0;
-		draw_panel_button(&scope_spr, bx + 4, 48, 46, 17, "KEY", show_key);
-		draw_panel_button(&scope_spr, bx + 57, 48, 46, 17, "ENV", show_env);
-		draw_panel_button(&scope_spr, bx + 110, 48, 46, 17, "RAW", show_raw);
-	}
+	// 波形ON/OFFボタン (下段)
+	draw_panel_button(&scope_spr, 4, 48, 46, 17, "KEY", show_key);
+	draw_panel_button(&scope_spr, 57, 48, 46, 17, "ENV", show_env);
+	draw_panel_button(&scope_spr, 110, 48, 46, 17, "RAW", show_raw);
 
-	scope_spr.pushSprite((panel_wide == PANEL_WIDE_SCOPE) ? 0 : PANEL_W, PANEL_TOP);
+	scope_spr.pushSprite(PANEL_W, PANEL_TOP);
 }
 
 //==================================================================
 //	公開API
 //==================================================================
-static void alloc_sprites(void);
-
 void display_init(void)
 {
-	lcd.init_auto();              // ST7789 / ILI9341 (自動判定 or ビルドフラグ)
-	Serial.printf("[lcd] panel = %s\n", lcd.panel_name());
+	lcd.init();
 	lcd.setRotation(1);           // 320x240 横
-	touchcal_load(&lcd);          // SETUP で校正済みならその値を使う
 	lcd.setColorDepth(16);
 	lcd.fillScreen(TFT_BLACK);
 	lcd.setBrightness(200);
@@ -751,9 +665,12 @@ void display_init(void)
 	// 消えないようにする
 	lcd.setTextWrap(false);
 
-	alloc_sprites();
-
-	char_queue = xQueueCreate(128, sizeof(uint8_t));
+	status_spr.setColorDepth(16);
+	status_spr.createSprite(320, STATUS_H);
+	fft_spr.setColorDepth(16);
+	fft_spr.createSprite(PANEL_W, PANEL_H);
+	scope_spr.setColorDepth(16);
+	scope_spr.createSprite(PANEL_W, PANEL_H);
 
 	for (uint8_t r = 0; r < TEXT_ROWS; r++) {
 		for (uint8_t c = 0; c < TEXT_COLS; c++) {
@@ -762,13 +679,15 @@ void display_init(void)
 	}
 }
 
-//	スプラッシュ / About 共通の見出し
-void display_splash_header(int title_y)
+void display_splash(void)
 {
+	lcd.fillScreen(lgfx::color565(4, 10, 24));
 	lcd.setTextDatum(lgfx::textdatum_t::middle_center);
+
+	// タイトル (Orbitron: ネイティブ32px、拡大なし)
 	lcd.setFont(&fonts::Orbitron_Light_32);
 	lcd.setTextColor(C_STATUS_TX);
-	lcd.drawString("CW DECODER 4", 160, title_y);
+	lcd.drawString("CW DECODER", 160, 76);
 
 	// モールス飾り: "CQ" (-.-. --.-)
 	{
@@ -778,415 +697,79 @@ void display_splash_header(int title_y)
 			w += (*p == '-') ? 19 : (*p == '.') ? 10 : 15;
 		}
 		int x = (320 - w) / 2;
-		int y = title_y + 40;
 		for (const char *p = m; *p; p++) {
 			if (*p == '-') {
-				lcd.fillRoundRect(x, y, 14, 5, 2, C_WPM);
+				lcd.fillRoundRect(x, 116, 14, 5, 2, C_WPM);
 				x += 19;
 			} else if (*p == '.') {
-				lcd.fillRoundRect(x, y, 5, 5, 2, C_WPM);
+				lcd.fillRoundRect(x, 116, 5, 5, 2, C_WPM);
 				x += 10;
 			} else {
 				x += 15;
 			}
 		}
 	}
-	lcd.drawFastHLine(40, title_y + 64, 240, C_SEP);
-	lcd.setTextDatum(lgfx::textdatum_t::top_left);
-}
 
-//	スプラッシュの絵柄だけを描く (待ちも画面切替もしない)。
-//	最下段 (y 223..239) は空けてあり、起動時アップデートチェックが
-//	時刻同期や更新の状況をそこに書く (fwupdate.cpp)
-void display_splash_draw(void)
-{
-	lcd.fillScreen(DISPLAY_SPLASH_BG);
-	display_splash_header(76);
+	lcd.drawFastHLine(40, 140, 240, C_SEP);
 
-	lcd.setTextDatum(lgfx::textdatum_t::middle_center);
 	lcd.setFont(&fonts::Orbitron_Light_24);
 	lcd.setTextColor(C_EQ_LINE);
-	lcd.drawString("ESP32", 160, 168);
+	lcd.drawString("PICO 2", 160, 168);
 
 	lcd.setFont(&fonts::Font2);
 	lcd.setTextColor(C_LABEL);
-	{
-		char sub[64];
-		snprintf(sub, sizeof(sub), "%s / LovyanGFX  -  Version " FW_VERSION, lcd.panel_name());
-		lcd.drawString(sub, 160, 196);
-		snprintf(sub, sizeof(sub), "Build %s", FW_BUILD);
-		lcd.drawString(sub, 160, 214);
-	}
+	lcd.drawString("ST7789 / LovyanGFX  -  Version 3.2-pico2", 160, 202);
 
 	lcd.setTextDatum(lgfx::textdatum_t::top_left);
-}
-
-//	絵柄を描いて 1.5 秒見せる。デコーダ画面への切り替えはしない —
-//	この後に起動時アップデートチェックが同じ画面の最下段へ状況を書くので、
-//	切り替えは呼び出し側 (main.cpp) が最後に display_redraw() で行う
-void display_splash(void)
-{
-	display_splash_draw();
 	delay(1500);
-}
-
-// setup.cpp と同じ配色・体裁の確認ダイアログ (SETUP 画面 / 起動時アップデート
-// チェックで共有する)
-#define CFM_BTN_BG  lgfx::color565(26, 34, 46)
-#define CFM_BTN_BD  lgfx::color565(70, 92, 120)
-#define CFM_BTN_TX  lgfx::color565(190, 206, 226)
-#define CFM_OK_BG   lgfx::color565(24, 54, 42)
-#define CFM_OK_BD   lgfx::color565(90, 200, 140)
-#define CFM_DLG_BG  lgfx::color565(20, 27, 37)
-#define CFM_DLG_BD  lgfx::color565(120, 150, 190)
-#define CFM_VALUE   lgfx::color565(235, 240, 246)
-#define CFM_LABEL   lgfx::color565(120, 140, 165)
-
-static bool confirm_hit(int tx, int ty, int x, int y, int w, int h)
-{
-	return (tx >= x && tx < x + w && ty >= y && ty < y + h);
-}
-
-static void confirm_wait_release(LGFX *lcd_)
-{
-	int32_t tx, ty;
-	while (lcd_->getTouch(&tx, &ty)) {
-		delay(10);
-	}
-}
-
-static void confirm_draw_button(LGFX *lcd_, int x, int y, int w, int h, const char *label,
-                                uint16_t bg, uint16_t bd, uint16_t tx)
-{
-	lcd_->fillRoundRect(x, y, w, h, 6, bg);
-	lcd_->drawRoundRect(x, y, w, h, 6, bd);
-	lcd_->setFont(&fonts::lgfxJapanGothicP_16);
-	lcd_->setTextColor(tx, bg);
-	lcd_->setTextDatum(lgfx::textdatum_t::middle_center);
-	lcd_->drawString(label, x + w / 2, y + h / 2);
-	lcd_->setTextDatum(lgfx::textdatum_t::top_left);
-}
-
-bool display_confirm(LGFX *lcd_, const char *title, const char *line1, const char *line2,
-                     const char *ok_label)
-{
-	const int x = 24, y = 52, w = 272, h = 136;
-	lcd_->fillRoundRect(x, y, w, h, 8, CFM_DLG_BG);
-	lcd_->drawRoundRect(x, y, w, h, 8, CFM_DLG_BD);
-
-	lcd_->setFont(&fonts::lgfxJapanGothicP_16);
-	lcd_->setTextColor(CFM_VALUE, CFM_DLG_BG);
-	lcd_->setTextDatum(lgfx::textdatum_t::top_center);
-	lcd_->drawString(title, x + w / 2, y + 14);
-	lcd_->setTextColor(CFM_LABEL, CFM_DLG_BG);
-	lcd_->drawString(line1, x + w / 2, y + 44);
-	lcd_->drawString(line2, x + w / 2, y + 64);
-	lcd_->setTextDatum(lgfx::textdatum_t::top_left);
-
-	const int bw = 112, bh = 36, by = y + h - bh - 14;
-	const int bx_no = x + 16, bx_yes = x + w - bw - 16;
-	confirm_draw_button(lcd_, bx_no, by, bw, bh, "キャンセル", CFM_BTN_BG, CFM_BTN_BD, CFM_BTN_TX);
-	confirm_draw_button(lcd_, bx_yes, by, bw, bh, ok_label, CFM_OK_BG, CFM_OK_BD, CFM_BTN_TX);
-
-	confirm_wait_release(lcd_);
-	int32_t tx, ty;
-	for (;;) {
-		if (lcd_->getTouch(&tx, &ty)) {
-			bool yes = confirm_hit(tx, ty, bx_yes, by, bw, bh);
-			bool no = confirm_hit(tx, ty, bx_no, by, bw, bh);
-			confirm_wait_release(lcd_);
-			if (yes) return true;
-			if (no) return false;
-		}
-		delay(10);
-	}
-}
-
-LGFX *display_lcd(void)
-{
-	return &lcd;
-}
-
-void display_set_visible(uint8_t v)
-{
-	visible = v ? 1 : 0;
-}
-
-//	画面全体を現在のグリッド内容で描き直す (起動時 / 他画面から戻ったとき)
-void display_redraw(void)
-{
-	visible = 1;
 	lcd.fillScreen(TFT_BLACK);
 	lcd.drawFastHLine(0, STATUS_H, 320, C_SEP);
 	lcd.drawFastHLine(0, PANEL_TOP - 1, 320, C_SEP);
-	redraw_text_area();
-	if (cur_col < TEXT_COLS) {
-		draw_cursor(cur_row, cur_col, 1);
-	}
-	status_dirty = 1;
+	draw_cursor(0, 0, 1);
 }
-
-void display_set_center_tap(void (*fn)(void))
-{
-	center_tap_fn = fn;
-}
-
-void display_set_setup_tap(void (*fn)(void))
-{
-	setup_tap_fn = fn;
-}
-
-//	共有バッファは起動時に一度だけ DMA 対応メモリから確保し、以後解放しない。
-//	LovyanGFX のスプライトは DMA 対応内部メモリから取るため、WiFi を使った
-//	あとは断片化で 21KB の連続領域が取れず作り直しに失敗する (実機で発生)。
-static uint8_t *sprite_arena = NULL;
-
-void *display_sprite_arena(size_t need)
-{
-	if (!sprite_arena) {
-		sprite_arena = (uint8_t *)heap_caps_malloc(SPRITE_ARENA_BYTES, MALLOC_CAP_DMA);
-		Serial.printf("[lcd] sprite arena %u bytes %s\n", (unsigned)SPRITE_ARENA_BYTES,
-		              sprite_arena ? "ok" : "FAILED");
-	}
-	return (sprite_arena && need <= SPRITE_ARENA_BYTES) ? sprite_arena : NULL;
-}
-
-//	起動時アップデートの書き換え直前にだけ呼ぶ。mbedTLS は 16KB 級の連続領域を
-//	複数要求するので、この 89KB を返さないと TLS 接続が張れない (実機で発生)。
-//	スプライトはこの領域を指したままになるため、解放したら以後スプライトを使う
-//	描画はできない。呼び出し側は成否によらず再起動すること
-void display_sprite_arena_free(void)
-{
-	if (sprite_arena) {
-		heap_caps_free(sprite_arena);
-		sprite_arena = NULL;
-		Serial.printf("[lcd] sprite arena freed, heap=%u max_block=%u\n",
-		              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-	}
-}
-
-//	デコーダ画面の3枚を共有バッファの先頭から並べる。時計画面から戻ったとき
-//	中身は壊れているが、毎フレーム fillSprite から描くので問題ない
-//	全幅表示のときは隠れる側を描かないので、その 1 枚ぶんのバッファを
-//	広げる側に回す (共有バッファ 89KB の容量内に収まる)
-static void alloc_sprites(void)
-{
-	const size_t n_status = SPRITE_BYTES_16(320, STATUS_H);
-	const size_t n_panel = SPRITE_BYTES_16(PANEL_W, PANEL_H);
-	const size_t n_wide = SPRITE_BYTES_16(320, PANEL_H);
-	const size_t need = n_status + ((panel_wide != PANEL_WIDE_NONE) ? n_wide : n_panel * 2);
-	uint8_t *base = (uint8_t *)display_sprite_arena(need);
-	if (!base) return;
-	status_spr.setColorDepth(16);
-	status_spr.setBuffer(base, 320, STATUS_H);
-	fft_spr.setColorDepth(16);
-	scope_spr.setColorDepth(16);
-	if (panel_wide == PANEL_WIDE_FFT) {
-		fft_spr.setBuffer(base + n_status, 320, PANEL_H);
-	} else if (panel_wide == PANEL_WIDE_SCOPE) {
-		scope_spr.setBuffer(base + n_status, 320, PANEL_H);
-	} else {
-		fft_spr.setBuffer(base + n_status, PANEL_W, PANEL_H);
-		scope_spr.setBuffer(base + n_status + n_panel, PANEL_W, PANEL_H);
-	}
-}
-
-//	全幅表示の切り替え。スプライトを取り直し、下段を一度消してから描き直す
-static void set_panel_wide(uint8_t which)
-{
-	panel_wide = (panel_wide == which) ? PANEL_WIDE_NONE : which;
-	alloc_sprites();
-	display_lcd()->fillRect(0, PANEL_TOP, 320, PANEL_H, C_PANEL_BG);
-}
-
 
 void display_enqueue(uint8_t ch)
 {
-	if (char_queue) {
-		xQueueSend(char_queue, &ch, 0);
-	}
+	uint8_t head = __atomic_load_n(&char_q_head, __ATOMIC_RELAXED);
+	uint8_t next = (uint8_t)((head + 1) % CHAR_QUEUE_SIZE);
+	if (next == __atomic_load_n(&char_q_tail, __ATOMIC_ACQUIRE)) return;
+	char_queue[head] = ch;
+	__atomic_store_n(&char_q_head, next, __ATOMIC_RELEASE);
+
 	if (ch != ' ') {
 		uint32_t st, en;
 		dsp_scope_char_span(&st, &en);
 		if (en < st) en = st;
-		uint8_t h = ticker_head;
+		uint8_t h = __atomic_load_n(&ticker_head, __ATOMIC_RELAXED);
 		ticker[h].ch = ch;
-		ticker[h].col = (st + en) / 2;              // 符号区間の中央
-		ticker_head = (uint8_t)((h + 1) % TICKER_N);
-		scopelog_char(ch, ticker[h].col);
-	} else {
-		// 語間はスコープには描かないが、ログには残す (文字列の復元用)
-		scopelog_char(' ', dsp_scope_col_index());
+		ticker[h].col = (st + en) / 2;
+		__atomic_store_n(&ticker_head, (uint8_t)((h + 1) % TICKER_N), __ATOMIC_RELEASE);
 	}
 }
 
-//==================================================================
-//	タッチ操作
-//	- US/JPバッジ: モード切替
-//	- TONEボタン: AUTO→600→700→800→900→1000 の順送り
-//	- FFTパネル内: タップ位置の周波数に最も近いトーンを直接選択
-//==================================================================
-#define TOUCH_DEBUG 0
-
-// 「画面中央付近」の判定矩形 (文字エリアの中ほど)
-#define CENTER_X0 80
-#define CENTER_X1 240
-#define CENTER_Y0 60
-#define CENTER_Y1 140
-
-//	下段パネルのダブルタップ判定。抵抗膜なので座標が少しぶれる前提で、
-//	近い位置・短い間隔の 2 回を 1 組とみなす
-#define DTAP_MS 400
-#define DTAP_DIST 40
-static uint32_t dtap_ms = 0;
-static int16_t dtap_x = 0, dtap_y = 0;
-//	FFT のシングルタップ (トーン選択) は、ダブルタップの 1 打目で
-//	トーンが動かないよう DTAP_MS だけ保留してから実行する
-static uint8_t tone_pending = 0;
-static float tone_pending_hz = 0.0f;
-static uint32_t tone_pending_ms = 0;
-
-//	保留したトーン選択を確定させる (ダブルタップが来なかったとき)
-static void flush_tone_pending(void)
+static uint8_t display_dequeue(uint8_t *ch)
 {
-	if (!tone_pending || (millis() - tone_pending_ms) < DTAP_MS) return;
-	tone_pending = 0;
-	const float f = tone_pending_hz;
-	if (f < 400.0f || f > 1200.0f) return;
-	uint8_t best = 0;
-	float best_d = 1e9f;
-	for (uint8_t i = 0; i < DSP_TONE_COUNT; i++) {
-		float d = fabsf(f - (float)dsp_tone_hz_at(i));
-		if (d < best_d) {
-			best_d = d;
-			best = i;
-		}
-	}
-	dsp_set_tone(best);
+	uint8_t tail = __atomic_load_n(&char_q_tail, __ATOMIC_RELAXED);
+	if (tail == __atomic_load_n(&char_q_head, __ATOMIC_ACQUIRE)) return 0;
+	*ch = char_queue[tail];
+	__atomic_store_n(&char_q_tail,
+	                 (uint8_t)((tail + 1) % CHAR_QUEUE_SIZE),
+	                 __ATOMIC_RELEASE);
+	return 1;
 }
 
-static void poll_touch(void)
-{
-	static uint8_t touching = 0;
-	static uint32_t last_act_ms = 0;
-
-	flush_tone_pending();
-
-	int32_t x, y;
-	uint8_t now = (lcd.getTouch(&x, &y) > 0);
-
-#if TOUCH_DEBUG
-	if (now) {
-		static uint32_t dbg_ms = 0;
-		lcd.fillCircle(x, y, 3, TFT_RED);
-		if (millis() - dbg_ms > 200) {
-			dbg_ms = millis();
-			lgfx::touch_point_t tp;
-			int raw_n = lcd.getTouchRaw(&tp, 1);
-			Serial.printf("[diag] touch x=%d y=%d raw_n=%d raw=(%d,%d)\n",
-			              (int)x, (int)y, raw_n, (int)tp.x, (int)tp.y);
-		}
-	}
-#endif
-	if (now && !touching) {
-		uint32_t t = millis();
-		if ((t - last_act_ms) >= 250) {
-			if (y < TEXT_TOP + 8) {
-				// ステータス行 (少し下までタップ許容)
-				if (x >= ST_MODE_X - 2 && x < ST_MODE_X + ST_BTN_W + 4) {
-					decoder_toggle_mode();
-					last_act_ms = t;
-				} else if (x >= ST_TONE_X - 2 && x < ST_TONE_X + ST_BTN_W + 4) {
-					// TONE ボタン: AUTO → 600 → ... → 1000 → AUTO
-					dsp_set_tone((uint8_t)((dsp_tone_index() + 1) % (DSP_TONE_COUNT + 1)));
-					last_act_ms = t;
-				} else if (x >= ST_SETUP_X - 2 && x < ST_SETUP_X + ST_BTN_W + 4) {
-					if (setup_tap_fn) {
-						setup_tap_fn();
-						last_act_ms = t;
-					}
-				}
-			} else if (y >= CENTER_Y0 && y < CENTER_Y1 &&
-			           x >= CENTER_X0 && x < CENTER_X1) {
-				// 文字エリア中央付近: 時計画面へ
-				if (center_tap_fn) {
-					center_tap_fn();
-					last_act_ms = t;
-				}
-			} else if (y >= PANEL_TOP) {
-				// 下段パネル。スコープ側にオシロの波形ON/OFFボタンがある。
-				// それ以外の場所はダブルタップで全幅表示を切り替える。
-				// FFT のシングルタップはトーン選択なので、ダブルタップの
-				// 1 打目でトーンが動かないよう保留して、2 打目が来たら取り消す
-				const uint8_t on_scope =
-					(panel_wide == PANEL_WIDE_SCOPE) ? 1 :
-					(panel_wide == PANEL_WIDE_FFT) ? 0 : (x >= PANEL_W);
-				uint8_t handled = 0;
-
-				// ボタンは全幅表示でも画面上の位置が変わらないので、
-				// 当たり判定も画面座標のまま (右半分の相対位置) で見る
-				if (on_scope && y >= PANEL_TOP + 44) {
-					const int bx = (int)x - PANEL_W;
-					if (bx >= 4 && bx < 51)        { show_key ^= 1; handled = 1; }
-					else if (bx >= 57 && bx < 104) { show_env ^= 1; handled = 1; }
-					else if (bx >= 110 && bx < 157){ show_raw ^= 1; handled = 1; }
-					if (handled) last_act_ms = t;
-				}
-				if (!handled) {
-					const uint8_t dbl = (dtap_ms != 0) && ((t - dtap_ms) < DTAP_MS) &&
-					                    (abs((int)x - dtap_x) < DTAP_DIST) &&
-					                    (abs((int)y - dtap_y) < DTAP_DIST);
-					dtap_ms = t;
-					dtap_x = (int16_t)x;
-					dtap_y = (int16_t)y;
-					if (dbl) {
-						tone_pending = 0;          // 1 打目のトーン選択を取り消す
-						dtap_ms = 0;               // 3 打目を 2 打目にしない
-						set_panel_wide(on_scope ? PANEL_WIDE_SCOPE : PANEL_WIDE_FFT);
-						last_act_ms = t;
-					} else if (!on_scope) {
-						// FFT の 1 打目: ダブルタップでなければ後でトーン選択
-						tone_pending = 1;
-						tone_pending_hz = eq_hz_of_x((int)x);
-						tone_pending_ms = t;
-					}
-				}
-			}
-		}
-	}
-	touching = now;
-}
-
-// タッチポーリング周期 (ms)
-#define TOUCH_POLL_MS 50
+void display_toggle_key(void) { show_key ^= 1; }
+void display_toggle_env(void) { show_env ^= 1; }
+void display_toggle_raw(void) { show_raw ^= 1; }
 
 void display_update(void)
 {
-	scopelog_poll();                // ログ送出 (Core 1、非ブロッキング)
-	if (!visible) {
-		// 他画面表示中: 受信文字だけグリッドへ取り込む (描画しない)
-		uint8_t ch;
-		int budget = 8;
-		while (budget-- > 0 && xQueueReceive(char_queue, &ch, 0) == pdTRUE) {
-			text_putchar(ch);
-		}
-		return;
-	}
-	{
-		static uint32_t last_poll = 0;
-		uint32_t now = millis();
-		if ((now - last_poll) >= TOUCH_POLL_MS) {
-			last_poll = now;
-			poll_touch();
-		}
-	}
-
 	uint8_t ch;
 	int budget = 8;
-	while (budget-- > 0 && xQueueReceive(char_queue, &ch, 0) == pdTRUE) {
+	while (budget-- > 0 && display_dequeue(&ch)) {
 		text_putchar(ch);
 	}
 	draw_status();
-	if (panel_wide != PANEL_WIDE_SCOPE) draw_fft_panel();
-	if (panel_wide != PANEL_WIDE_FFT) draw_scope_panel();
+	draw_fft_panel();
+	draw_scope_panel();
 }

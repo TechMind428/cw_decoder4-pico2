@@ -1,26 +1,11 @@
-.pio
+.pio/
 .DS_Store
+**/.DS_Store
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
 
-# Web 版のビルド生成物。
-# cwcore.wasm は lld が要るのであえて追跡する (これだけで動かせるように)。
-# cw-decoder.html は python3 だけで作り直せるので追跡しない
-# (72KB の全文が毎回差分に出て邪魔なため)。再生成: python3 web/bundle.py
-web/cw-decoder.html
-
-# テスト用の音声はリポジトリに入れない (公開しない)。
-# web/tools/ に置いておけば「音声ファイル」タブから読ませて使える。
-# 調査記録が参照しているファイル名はそのまま残してあるので、
-# 手元に同名で置けば README の手順を再現できる。
-# 拡張子を並べると漏れるので、音声はディレクトリごと除外して
-# 必要なものだけ明示的に足す方針にする (m4a を取りこぼした実績あり)
-web/tools/*.mp3
-web/tools/*.wav
-web/tools/*.m4a
-web/tools/*.aac
-web/tools/*.flac
-web/tools/*.ogg
-web/tools/*.opus
+# Local source material (kept outside Git history)
+/写真/
+/CW_配線図のコ*.pptx

@@ -1,5 +1,5 @@
 //
-//	DSP タスク (Core 0)
+//	DSP処理 (Raspberry Pi Pico 2 Core 1)
 //	- ADC DMA から 30サンプル(3.75ms)単位で取得
 //	- トーン判定は 3ビン float Goertzel (CH32版 v1.8/1.9 と同一方式)。
 //	  サイドは EMA(α=1/4) 平滑と瞬時値の両方をデコーダへ渡す。
@@ -7,12 +7,14 @@
 //	- オシロ用に hop 毎の生波形 min/max + エンベロープ + ゲートを記録
 //
 #include <Arduino.h>
+#include <pico/mutex.h>
 #include <math.h>
 #include <string.h>
 #include "dsp.h"
 #include "audio.h"
 #include "decoder.h"
 #include "float_fft.h"
+#include "board_config.h"
 
 #define SCOPE_RING_SIZE 256
 // スコープ掃引はWPM追従: 1列のhop数 = 60/WPM (Q8の分数蓄積でリニアに)。
@@ -93,15 +95,22 @@ static volatile uint8_t gate_win = DSP_GATE_WIN_LONG;
 static volatile int32_t last_side_norm = 0;
 static volatile int32_t last_near_norm = 0;
 
-static portMUX_TYPE dsp_mux = portMUX_INITIALIZER_UNLOCKED;
+static mutex_t dsp_mux;
+static mutex_t tone_mux;
+static uint8_t dsp_ready = 0;
 static volatile uint8_t dsp_paused = 0;
-static volatile uint8_t dsp_idle = 0;       // 1=一時停止中でタスクが audio_read を呼んでいない
-static volatile uint8_t dsp_alive = 0;
 
 static void gate_update_coeff(void);
 
+static uint8_t is_dsp_ready(void)
+{
+	return __atomic_load_n(&dsp_ready, __ATOMIC_ACQUIRE);
+}
+
 void dsp_set_tone(uint8_t idx)
 {
+	if (!is_dsp_ready()) return;
+	mutex_enter_blocking(&tone_mux);
 	if (idx > DSP_TONE_AUTO) idx = 0;
 	tone_sel = idx;
 	if (idx != DSP_TONE_AUTO) {
@@ -116,6 +125,7 @@ void dsp_set_tone(uint8_t idx)
 	side_ema_started = 0;
 	cand_cnt = 0;
 	gate_update_coeff();
+	mutex_exit(&tone_mux);
 }
 
 uint8_t dsp_tone_index(void)
@@ -151,7 +161,12 @@ uint16_t dsp_scope_period_q8(void)
 int dsp_get_scope_since(uint32_t from_idx, scope_col_t *out, int max,
                         uint32_t *first, uint32_t *lost)
 {
-	taskENTER_CRITICAL(&dsp_mux);
+	if (!is_dsp_ready()) {
+		*first = from_idx;
+		*lost = 0;
+		return 0;
+	}
+	mutex_enter_blocking(&dsp_mux);
 	uint32_t total = scope_total;
 	uint32_t oldest = (total > SCOPE_RING_SIZE) ? total - SCOPE_RING_SIZE : 0;
 	uint32_t start = from_idx;
@@ -164,7 +179,7 @@ int dsp_get_scope_since(uint32_t from_idx, scope_col_t *out, int max,
 	for (uint32_t i = start; i < total && n < max; i++, n++) {
 		out[n] = scope_ring[i % SCOPE_RING_SIZE];
 	}
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 	*first = start;
 	return n;
 }
@@ -179,25 +194,37 @@ void dsp_scope_char_span(uint32_t *start, uint32_t *end)
 int dsp_get_scope(scope_col_t *out, int n)
 {
 	if (n > SCOPE_RING_SIZE) n = SCOPE_RING_SIZE;
-	taskENTER_CRITICAL(&dsp_mux);
+	if (!is_dsp_ready()) {
+		memset(out, 0, n * sizeof(scope_col_t));
+		return n;
+	}
+	mutex_enter_blocking(&dsp_mux);
 	uint16_t pos = scope_pos;
 	for (int i = 0; i < n; i++) {
 		out[i] = scope_ring[(pos + SCOPE_RING_SIZE - n + i) % SCOPE_RING_SIZE];
 	}
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 	return n;
 }
 
 void dsp_get_spectrum(uint16_t *out)
 {
-	taskENTER_CRITICAL(&dsp_mux);
+	if (!is_dsp_ready()) {
+		memset(out, 0, sizeof(spec_mag));
+		return;
+	}
+	mutex_enter_blocking(&dsp_mux);
 	memcpy(out, spec_mag, sizeof(spec_mag));
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 }
 
 uint16_t dsp_peak_hz(void)
 {
-	return peak_hz;
+	if (!is_dsp_ready()) return 0;
+	mutex_enter_blocking(&dsp_mux);
+	uint16_t value = peak_hz;
+	mutex_exit(&dsp_mux);
+	return value;
 }
 
 uint16_t dsp_scope_col_ms_x10(void)
@@ -541,18 +568,17 @@ static void process_spectrum(void)
 		peak_cand_cnt = 0;
 	}
 
-	taskENTER_CRITICAL(&dsp_mux);
+	mutex_enter_blocking(&dsp_mux);
 	memcpy(spec_mag, local, sizeof(spec_mag));
 	peak_hz = pk;
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 }
 
 //==================================================================
 //	DSPタスク本体
 //==================================================================
 //	ブロック 1 回ぶん (DSP_HOP サンプル) の処理。
-//	ESP32 では dsp_task() が無限ループで回し、Web (WASM) ビルドでは
-//	AudioWorklet が供給できたぶんだけ外から dsp_step() を呼ぶ。
+//	Pico 2のloop1()から、DMAが供給するたびにdsp_step()を呼ぶ。
 //	状態はステップ間で持ち越すので、元は dsp_task のローカルだったものを
 //	すべて static にしてある。本体を do { ... } while (0) で囲ってあるので、
 //	中の continue は「このステップを打ち切る」の意味のまま変わらない。
@@ -574,14 +600,12 @@ void dsp_step(void)
 
 	do {
 		if (dsp_paused) {
-			// 一時停止中は ADC に触らない (呼び出し側が DMA を止めている)
-			dsp_idle = 1;
-			vTaskDelay(pdMS_TO_TICKS(10));
+			delay(1);
 			continue;
 		}
-		dsp_idle = 0;
 		size_t got = audio_read(raw, DSP_HOP);
 		if (got == 0) continue;
+		digitalWrite(PIN_TEST_OUT, HIGH);
 		samples_total += got;
 
 		int16_t mn = 32767, mx = -32768;
@@ -608,7 +632,9 @@ void dsp_step(void)
 			input_peak = (int16_t)((ipk > 2048) ? 2048 : ipk);
 		}
 
+		mutex_enter_blocking(&tone_mux);
 		int32_t mag = process_gate();
+		mutex_exit(&tone_mux);
 		uint16_t mag16 = (mag > 65535) ? 65535 : (uint16_t)((mag < 0) ? 0 : mag);
 		{
 			// 文字の符号区間の追跡 (デコード文字のスコープ表示用)
@@ -668,7 +694,7 @@ void dsp_step(void)
 		col_acc_q8 += 256;
 		if (col_acc_q8 >= scope_period_q8) {
 			col_acc_q8 -= scope_period_q8;
-			taskENTER_CRITICAL(&dsp_mux);
+			mutex_enter_blocking(&dsp_mux);
 			scope_col_t *col = &scope_ring[scope_pos];
 			col->mn = col_mn;
 			col->mx = col_mx;
@@ -693,7 +719,7 @@ void dsp_step(void)
 			col->hops = col_hops;
 			scope_pos = (uint16_t)((scope_pos + 1) % SCOPE_RING_SIZE);
 			scope_total = scope_total + 1;      // volatile への ++ は非推奨
-			taskEXIT_CRITICAL(&dsp_mux);
+			mutex_exit(&dsp_mux);
 			col_mn = 32767;
 			col_mx = -32768;
 			col_m1 = 0;
@@ -715,7 +741,9 @@ void dsp_step(void)
 
 		if (++spec_div >= SPEC_INTERVAL_HOPS) {
 			spec_div = 0;
+			mutex_enter_blocking(&tone_mux);
 			process_spectrum();
+			mutex_exit(&tone_mux);
 		}
 
 #if DSP_DIAG
@@ -764,47 +792,28 @@ void dsp_step(void)
 			}
 		}
 #endif
+		digitalWrite(PIN_CW_LED, decoder_gate() ? HIGH : LOW);
+		digitalWrite(PIN_TEST_OUT, LOW);
 	} while (0);
 }
 
-static void dsp_task(void *arg)
-{
-	dsp_alive = 1;
-	for (;;) {
-		dsp_step();
-	}
-}
-
-//	一時停止: タスクを待機させてから ADC DMA を止める。
-//	ADC continuous DMA を動かしたまま WiFi を起動すると割り込み
-//	ウォッチドッグ (TG1WDT) でリセットされるため、WiFi を使う間は
-//	必ず DMA を止める。再開時は ADC を初期化し直す。
+//	上流とのAPI互換用。Pico 2版はWi-Fi/OTAを組み込まない。
 void dsp_set_paused(uint8_t paused)
 {
-	if (paused) {
-		if (dsp_paused) return;
-		dsp_paused = 1;
-		for (int i = 0; i < 50 && dsp_alive && !dsp_idle; i++) {
-			delay(10);                  // 進行中の audio_read (最大7.4ms) を待つ
-		}
-		audio_stop();
-		Serial.printf("[dsp] paused (idle=%d) heap=%u\n", (int)dsp_idle,
-		              (unsigned)ESP.getFreeHeap());
-	} else {
-		if (!dsp_paused) return;
-		audio_init();
-		dsp_paused = 0;
-		Serial.printf("[dsp] resumed heap=%u\n", (unsigned)ESP.getFreeHeap());
-	}
+	// Pico 2版ではWi-Fi/OTAを使用しないため、DMA停止を伴う一時停止は不要。
+	// API互換のため処理ループの停止フラグだけを提供する。
+	dsp_paused = paused ? 1 : 0;
 }
 
 void dsp_start(void)
 {
+	mutex_init(&dsp_mux);
+	mutex_init(&tone_mux);
 	gate_update_coeff();
 	for (int i = 0; i < DSP_SPEC_N; i++) {
 		hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(DSP_SPEC_N - 1)));
 	}
 	memset(scope_ring, 0, sizeof(scope_ring));
 	memset(spec_mag, 0, sizeof(spec_mag));
-	xTaskCreatePinnedToCore(dsp_task, "dsp", 8192, NULL, 3, NULL, 0);
+	__atomic_store_n(&dsp_ready, 1, __ATOMIC_RELEASE);
 }

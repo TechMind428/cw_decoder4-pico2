@@ -36,7 +36,7 @@ typedef struct {
 } scope_col_t;
 
 #define DSP_TONE_COUNT 5            // 600/700/800/900/1000Hz
-#define DSP_TONE_AUTO DSP_TONE_COUNT // AUTO: 600〜1000Hzの最強ピークへ自動同調
+#define DSP_TONE_AUTO DSP_TONE_COUNT // AUTO: 500〜1000Hzの最強ピークへ自動同調
 // トーン判定Goertzel窓。長い方 120 = 15ms (帯域66.7Hz)、短い方 60 = 7.5ms (133Hz)。
 // サイドビンはどちらの窓でも矩形窓のヌル上に乗る (長窓で±2/±4、短窓で±1/±2)
 #define DSP_GATE_WIN_LONG 120
@@ -44,13 +44,9 @@ typedef struct {
 #define DSP_GATE_WIN DSP_GATE_WIN_LONG      // バッファ確保用 (最大値)
 
 void dsp_start(void);
-// ブロック 1 回ぶん (DSP_HOP サンプル) を処理する。ESP32 では内部の DSP
-// タスクが回すので呼ぶ必要はない。Web (WASM) ビルドが外から駆動するために公開。
+// Core 1のloop1()から呼び、DSP_HOPサンプルの1ブロックを処理する。
 void dsp_step(void);
-// 一時停止: DSPタスクを待機させ ADC DMA を止める (再開時に初期化し直す)。
-// WiFi を使う間 (NTP同期 / WiFi設定) は必ず止めること: DMA を動かしたまま
-// WiFi を起動すると割り込みウォッチドッグでリセットされる。
-// 無線ノイズがデコーダ状態に入らない効果も兼ねる
+// 上流とのAPI互換用。Pico 2版ではWi-Fi/OTAからは呼ばれない。
 void dsp_set_paused(uint8_t paused);
 void dsp_set_tone(uint8_t idx);     // 0..4=手動 / DSP_TONE_AUTO=自動
 uint8_t dsp_tone_index(void);
@@ -72,12 +68,12 @@ uint16_t dsp_scope_period_q8(void);     // 現在の 1 列あたり hop 数 (Q8)
 void dsp_scope_char_span(uint32_t *start, uint32_t *end);
 // スコープ1列の時間 (0.1ms単位)。掃引はWPM追従で可変
 uint16_t dsp_scope_col_ms_x10(void);
-// 現在のトーン判定帯域幅 (Hz)。窓長のWPM追従で83/167が切り替わる
+// 現在のトーン判定帯域幅 (Hz)。窓長のWPM追従で約67/133が切り替わる
 uint16_t dsp_gate_bw_hz(void);
 // 入力レベル (ADCフルスケール比 0〜100%)。100%付近はクリップの目安
 uint8_t dsp_input_level_pct(void);
 // 入力ピーク振幅 (カウント、0〜2048 = ADC 半スイング、ピークホールド)。
-// 1 カウント ≈ 0.76mV (12dB 減衰)。dB 表示用
+// Pico ADCでは1カウント ≈ 0.806mV。dB表示用
 int16_t dsp_input_peak(void);
 // DSP_SPEC_BINS+1 個 (bin 0..64) をコピー
 void dsp_get_spectrum(uint16_t *out);
