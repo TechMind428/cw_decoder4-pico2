@@ -9,3 +9,7 @@
 # Local source material (kept outside Git history)
 /写真/
 /CW_配線図のコ*.pptx
+
+# Editable hardware drawings stay local; publish the exported PDF instead.
+/hardware/wiring/*.ppt
+/hardware/wiring/*.pptx

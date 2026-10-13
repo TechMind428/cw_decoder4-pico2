@@ -109,7 +109,7 @@ SW2の選択順は`AUTO → 600 → 700 → 800 → 900 → 1000Hz → AUTO`で�
 | 内蔵 | GP25 | CW状態LED |
 | 16 | GP12 | DSP処理タイミングTEST出力 |
 
-配線とAF入力回路は[`hardware/wiring/CW_配線図.pptx`](hardware/wiring/CW_%E9%85%8D%E7%B7%9A%E5%9B%B3.pptx)を参照してください。
+配線とAF入力回路は[`hardware/wiring/CW_配線図.pdf`](hardware/wiring/CW_%E9%85%8D%E7%B7%9A%E5%9B%B3.pdf)を参照してください。
 GP26は0〜3.3Vの範囲を超えないようにしてください。
 
 ## ビルドとPico 2への転送
@@ -157,8 +157,11 @@ git switch -c codex/pico2-next upstream/main
 
 ## ハードウェア資料
 
-- `hardware/wiring/`: 配線図とLCD寸法資料
+- `hardware/wiring/`: 配線図PDF
 - `hardware/case/`: ケースの3MFデータとLCD機械寸法DXF
+
+編集用の`CW_配線図.pptx`と`LCDサイズ.pptx`はローカルだけに保存し、
+Gitでは追跡しません。
 
 ## ライセンス
 
