@@ -1,12 +1,13 @@
 //
-//	CWデコーダ状態機械 (ESP32移植版)
+//	CWデコーダ状態機械 (Pico 2移植版)
 //	CH32V006版 cw_decoder.cpp v1.9 のロジックを移植:
 //	- トーン判定ヒステリシス (ON 0.6x/3x, OFF 0.4x/2.5x)
 //	- ノイズブランカ (短点長の1/5〜1/3, 3〜8ms)
 //	- ギャップ(文字内/文字間)も使う速度推定 + 20〜35wpm帯スナップ
-//	入力(トーン検出)は Goertzel から FFT ベースに変更 (dsp.cpp 側)。
+//	入力トーンはdsp.cppの3ビンfloat Goertzelで検出する。
 //
 #include <Arduino.h>
+#include <pico/mutex.h>
 #include <string.h>
 #include "decoder.h"
 #include "decode.h"
@@ -49,11 +50,12 @@ static uint32_t last_gap_ms = 0;
 static char sw_mode = MODE_US;
 static uint8_t lastChar = 0;
 static void (*emit_fn)(uint8_t ch) = nullptr;
+static mutex_t decoder_mux;
+static uint8_t decoder_ready = 0;
 
 // デコーダ内部時刻 (ms)。millis() ではなくサンプル数由来のブロック
-// クロックを使う: I2S DMA のバッファリングでブロック処理がまとめて
-// 走ると、millis() ではマーク/スペース長がバッファ長単位に量子化され
-// 測定を壊すため (実測で32ms単位になりデコード率が劣化した)。
+// クロックを使う。DMAや描画の処理時間に左右されず、マーク/スペース長を
+// 常に6ms単位で測るため。
 static uint32_t dec_ms = 0;
 
 //==================================================================
@@ -206,6 +208,7 @@ static void decode_and_display(void)
 //==================================================================
 void decoder_init(void)
 {
+	mutex_init(&decoder_mux);
 	magnitudelimit = magnitudelimit_low;
 	realstate = realstatebefore = KEY_LOW;
 	filteredstate = filteredstatebefore = KEY_LOW;
@@ -222,6 +225,7 @@ void decoder_init(void)
 	laststarttime = 0;
 	starttimehigh = 0;
 	startttimelow = 0;
+	decoder_ready = 1;
 }
 
 void decoder_set_emit(void (*fn)(uint8_t ch))
@@ -231,28 +235,47 @@ void decoder_set_emit(void (*fn)(uint8_t ch))
 
 uint16_t decoder_wpm(void)
 {
-	return wpm;
+	if (!decoder_ready) return 0;
+	mutex_enter_blocking(&decoder_mux);
+	uint16_t value = wpm;
+	mutex_exit(&decoder_mux);
+	return value;
 }
 
 uint8_t decoder_gate(void)
 {
-	return (uint8_t)filteredstate;
+	if (!decoder_ready) return 0;
+	mutex_enter_blocking(&decoder_mux);
+	uint8_t value = (uint8_t)filteredstate;
+	mutex_exit(&decoder_mux);
+	return value;
 }
 
 int32_t decoder_maglimit(void)
 {
-	return magnitudelimit;
+	if (!decoder_ready) return 0;
+	mutex_enter_blocking(&decoder_mux);
+	int32_t value = magnitudelimit;
+	mutex_exit(&decoder_mux);
+	return value;
 }
 
 uint8_t decoder_mode(void)
 {
-	return (uint8_t)sw_mode;
+	if (!decoder_ready) return MODE_US;
+	mutex_enter_blocking(&decoder_mux);
+	uint8_t value = (uint8_t)sw_mode;
+	mutex_exit(&decoder_mux);
+	return value;
 }
 
 void decoder_toggle_mode(void)
 {
+	if (!decoder_ready) return;
+	mutex_enter_blocking(&decoder_mux);
 	sw_mode ^= 1;
 	code[0] = '\0';
+	mutex_exit(&decoder_mux);
 }
 
 //==================================================================
@@ -261,6 +284,8 @@ void decoder_toggle_mode(void)
 void decoder_process_block(int32_t magnitude, int32_t side_mag, int32_t side_mag_inst,
                            int32_t side_mag_max)
 {
+	if (!decoder_ready) return;
+	mutex_enter_blocking(&decoder_mux);
 	dec_ms += DEC_BLOCK_MS;
 
 	// 立ち上がり(現在LOW)時のみ瞬時サイドも見る:
@@ -405,4 +430,5 @@ void decoder_process_block(int32_t magnitude, int32_t side_mag, int32_t side_mag
 
 	realstatebefore = realstate;
 	filteredstatebefore = filteredstate;
+	mutex_exit(&decoder_mux);
 }

@@ -1,6 +1,6 @@
 //
 //	画面構成 (320x240 横):
-//	  y   0..26  ステータス行 (US/JPボタン / SPEED / トーン切替 < chip >)
+//	  y   0..26  ステータス行 (US/JP / SPEED / トーン表示)
 //	  y  28..171 デコード文字エリア 16列 x 6行 (24x24 全角フォント、ピッチ20px)
 //	  y 173..239 左: FFTスペクトラム(PK表示) / 右: オシロスコープ(波形ON/OFFボタン)
 //	オシロは生波形(min/maxバンド)・トーンエンベロープ・キー判定を
@@ -69,7 +69,10 @@ static LGFX_Sprite fft_spr(&lcd);
 static LGFX_Sprite scope_spr(&lcd);
 static LGFX_Sprite status_spr(&lcd);
 
-static QueueHandle_t char_queue;
+#define CHAR_QUEUE_SIZE 128
+static uint8_t char_queue[CHAR_QUEUE_SIZE];
+static uint8_t char_q_head = 0;
+static uint8_t char_q_tail = 0;
 
 static uint16_t grid[TEXT_ROWS][TEXT_COLS];
 static uint8_t cur_row = 0;
@@ -270,7 +273,7 @@ static void text_putchar(uint8_t ch)
 //==================================================================
 //	ステータス行
 //==================================================================
-// スコープ波形の表示ON/OFF (タッチで切替、デフォルト全ON)
+// スコープ波形の表示ON/OFF (プッシュスイッチで切替、デフォルト全ON)
 static uint8_t show_key = 1;
 static uint8_t show_env = 1;
 static uint8_t show_raw = 1;
@@ -615,8 +618,6 @@ void display_init(void)
 	scope_spr.setColorDepth(16);
 	scope_spr.createSprite(PANEL_W, PANEL_H);
 
-	char_queue = xQueueCreate(128, sizeof(uint8_t));
-
 	for (uint8_t r = 0; r < TEXT_ROWS; r++) {
 		for (uint8_t c = 0; c < TEXT_COLS; c++) {
 			grid[r][c] = ' ';
@@ -659,11 +660,11 @@ void display_splash(void)
 
 	lcd.setFont(&fonts::Orbitron_Light_24);
 	lcd.setTextColor(C_EQ_LINE);
-	lcd.drawString("ESP32", 160, 168);
+	lcd.drawString("PICO 2", 160, 168);
 
 	lcd.setFont(&fonts::Font2);
 	lcd.setTextColor(C_LABEL);
-	lcd.drawString("ST7789 / LovyanGFX  -  Version 2.0", 160, 202);
+	lcd.drawString("ST7789 / LovyanGFX  -  Version 2.1", 160, 202);
 
 	lcd.setTextDatum(lgfx::textdatum_t::top_left);
 	delay(1500);
@@ -675,109 +676,33 @@ void display_splash(void)
 
 void display_enqueue(uint8_t ch)
 {
-	if (char_queue) {
-		xQueueSend(char_queue, &ch, 0);
-	}
+	uint8_t head = __atomic_load_n(&char_q_head, __ATOMIC_RELAXED);
+	uint8_t next = (uint8_t)((head + 1) % CHAR_QUEUE_SIZE);
+	if (next == __atomic_load_n(&char_q_tail, __ATOMIC_ACQUIRE)) return;
+	char_queue[head] = ch;
+	__atomic_store_n(&char_q_head, next, __ATOMIC_RELEASE);
 }
 
-//==================================================================
-//	タッチ操作
-//	- US/JPバッジ: モード切替
-//	- TONE表示: トーン周波数を順送り (600→700→800→900→1000)
-//	- FFTパネル内: タップ位置の周波数に最も近いトーンを直接選択
-//==================================================================
-#define TOUCH_DEBUG 0
-
-static void poll_touch(void)
+static uint8_t display_dequeue(uint8_t *ch)
 {
-	static uint8_t touching = 0;
-	static uint32_t last_act_ms = 0;
-
-	int32_t x, y;
-	uint8_t now = (lcd.getTouch(&x, &y) > 0);
-
-#if TOUCH_DEBUG
-	if (now) {
-		static uint32_t dbg_ms = 0;
-		lcd.fillCircle(x, y, 3, TFT_RED);
-		if (millis() - dbg_ms > 200) {
-			dbg_ms = millis();
-			lgfx::touch_point_t tp;
-			int raw_n = lcd.getTouchRaw(&tp, 1);
-			Serial.printf("[diag] touch x=%d y=%d raw_n=%d raw=(%d,%d)\n",
-			              (int)x, (int)y, raw_n, (int)tp.x, (int)tp.y);
-		}
-	}
-#endif
-	if (now && !touching) {
-		uint32_t t = millis();
-		if ((t - last_act_ms) >= 250) {
-			if (y < TEXT_TOP + 8) {
-				// ステータス行 (少し下までタップ許容)
-				if (x < 70) {
-					decoder_toggle_mode();
-					last_act_ms = t;
-				} else if (x >= 160 && x < 196) {
-					// < : トーンを前へ
-					dsp_set_tone((uint8_t)((dsp_tone_index() + DSP_TONE_COUNT) % (DSP_TONE_COUNT + 1)));
-					last_act_ms = t;
-				} else if (x >= 196) {
-					// 中央チップ / > : トーンを次へ
-					dsp_set_tone((uint8_t)((dsp_tone_index() + 1) % (DSP_TONE_COUNT + 1)));
-					last_act_ms = t;
-				}
-			} else if (y >= PANEL_TOP + 40 && x >= PANEL_W) {
-				// スコープの波形ON/OFFボタン (下段)
-				int lx = (int)x - PANEL_W;
-				if (lx >= 4 && lx < 51) {
-					show_key ^= 1;
-					last_act_ms = t;
-				} else if (lx >= 57 && lx < 104) {
-					show_env ^= 1;
-					last_act_ms = t;
-				} else if (lx >= 110 && lx < 157) {
-					show_raw ^= 1;
-					last_act_ms = t;
-				}
-			} else if (y >= PANEL_TOP && x < PANEL_W) {
-				// FFTパネル: タップ位置の周波数に最も近いトーンを選択
-				float f = EQ_F_MIN + (float)(x - EQ_X0) * EQ_HZ_PER_PX;
-				if (f >= 400.0f && f <= 1200.0f) {
-					uint8_t best = 0;
-					float best_d = 1e9f;
-					for (uint8_t i = 0; i < DSP_TONE_COUNT; i++) {
-						float d = fabsf(f - (float)dsp_tone_hz_at(i));
-						if (d < best_d) {
-							best_d = d;
-							best = i;
-						}
-					}
-					dsp_set_tone(best);
-					last_act_ms = t;
-				}
-			}
-		}
-	}
-	touching = now;
+	uint8_t tail = __atomic_load_n(&char_q_tail, __ATOMIC_RELAXED);
+	if (tail == __atomic_load_n(&char_q_head, __ATOMIC_ACQUIRE)) return 0;
+	*ch = char_queue[tail];
+	__atomic_store_n(&char_q_tail,
+	                 (uint8_t)((tail + 1) % CHAR_QUEUE_SIZE),
+	                 __ATOMIC_RELEASE);
+	return 1;
 }
 
-// タッチポーリング周期 (ms)
-#define TOUCH_POLL_MS 50
+void display_toggle_key(void) { show_key ^= 1; }
+void display_toggle_env(void) { show_env ^= 1; }
+void display_toggle_raw(void) { show_raw ^= 1; }
 
 void display_update(void)
 {
-	{
-		static uint32_t last_poll = 0;
-		uint32_t now = millis();
-		if ((now - last_poll) >= TOUCH_POLL_MS) {
-			last_poll = now;
-			poll_touch();
-		}
-	}
-
 	uint8_t ch;
 	int budget = 8;
-	while (budget-- > 0 && xQueueReceive(char_queue, &ch, 0) == pdTRUE) {
+	while (budget-- > 0 && display_dequeue(&ch)) {
 		text_putchar(ch);
 	}
 	draw_status();

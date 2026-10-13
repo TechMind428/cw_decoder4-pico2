@@ -8,3 +8,6 @@ void display_init(void);
 void display_splash(void);
 void display_enqueue(uint8_t ch);   // decoder emit callback (thread-safe)
 void display_update(void);          // call from loop (~30fps)
+void display_toggle_key(void);
+void display_toggle_env(void);
+void display_toggle_raw(void);

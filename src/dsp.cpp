@@ -1,18 +1,20 @@
 //
-//	DSP タスク (Core 0)
-//	- I2S DMA から 48サンプル(6ms)単位で取得
+//	DSP processing (Raspberry Pi Pico 2 Core 1)
+//	- ADC DMA から 48サンプル(6ms)単位で取得
 //	- トーン判定は 3ビン float Goertzel (CH32版 v1.8/1.9 と同一方式)。
 //	  サイドは EMA(α=1/4) 平滑と瞬時値の両方をデコーダへ渡す。
 //	- 256pt FFT (Hann窓) でスペクトラム表示用データ生成
 //	- オシロ用に hop 毎の生波形 min/max + エンベロープ + ゲートを記録
 //
 #include <Arduino.h>
+#include <pico/mutex.h>
 #include <math.h>
 #include <string.h>
 #include "dsp.h"
 #include "audio.h"
 #include "decoder.h"
 #include "float_fft.h"
+#include "board_config.h"
 
 #define SCOPE_RING_SIZE 256
 // スコープ掃引はWPM追従: 1列のhop数 = 60/WPM (Q8の分数蓄積でリニアに)。
@@ -62,12 +64,21 @@ static uint8_t side_ema_started = 0;
 // 6ms窓(48)へ戻す。ヒステリシス: ≥32WPMで48 / ≤28WPMで96。
 static volatile uint8_t gate_win = DSP_GATE_WIN;
 
-static portMUX_TYPE dsp_mux = portMUX_INITIALIZER_UNLOCKED;
+static mutex_t dsp_mux;
+static mutex_t tone_mux;
+static uint8_t dsp_ready = 0;
 
 static void gate_update_coeff(void);
 
+static uint8_t is_dsp_ready(void)
+{
+	return __atomic_load_n(&dsp_ready, __ATOMIC_ACQUIRE);
+}
+
 void dsp_set_tone(uint8_t idx)
 {
+	if (!is_dsp_ready()) return;
+	mutex_enter_blocking(&tone_mux);
 	if (idx > DSP_TONE_AUTO) idx = 0;
 	tone_sel = idx;
 	if (idx != DSP_TONE_AUTO) {
@@ -77,6 +88,7 @@ void dsp_set_tone(uint8_t idx)
 	side_ema_started = 0;
 	cand_cnt = 0;
 	gate_update_coeff();
+	mutex_exit(&tone_mux);
 }
 
 uint8_t dsp_tone_index(void)
@@ -102,25 +114,37 @@ uint16_t dsp_tone_hz_at(uint8_t idx)
 int dsp_get_scope(scope_col_t *out, int n)
 {
 	if (n > SCOPE_RING_SIZE) n = SCOPE_RING_SIZE;
-	taskENTER_CRITICAL(&dsp_mux);
+	if (!is_dsp_ready()) {
+		memset(out, 0, n * sizeof(scope_col_t));
+		return n;
+	}
+	mutex_enter_blocking(&dsp_mux);
 	uint16_t pos = scope_pos;
 	for (int i = 0; i < n; i++) {
 		out[i] = scope_ring[(pos + SCOPE_RING_SIZE - n + i) % SCOPE_RING_SIZE];
 	}
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 	return n;
 }
 
 void dsp_get_spectrum(uint16_t *out)
 {
-	taskENTER_CRITICAL(&dsp_mux);
+	if (!is_dsp_ready()) {
+		memset(out, 0, sizeof(spec_mag));
+		return;
+	}
+	mutex_enter_blocking(&dsp_mux);
 	memcpy(out, spec_mag, sizeof(spec_mag));
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 }
 
 uint16_t dsp_peak_hz(void)
 {
-	return peak_hz;
+	if (!is_dsp_ready()) return 0;
+	mutex_enter_blocking(&dsp_mux);
+	uint16_t value = peak_hz;
+	mutex_exit(&dsp_mux);
+	return value;
 }
 
 uint16_t dsp_scope_col_ms_x10(void)
@@ -364,31 +388,31 @@ static void process_spectrum(void)
 		pk = (uint16_t)(f + 0.5f);
 	}
 
-	taskENTER_CRITICAL(&dsp_mux);
+	mutex_enter_blocking(&dsp_mux);
 	memcpy(spec_mag, local, sizeof(spec_mag));
 	peak_hz = pk;
-	taskEXIT_CRITICAL(&dsp_mux);
+	mutex_exit(&dsp_mux);
 }
 
 //==================================================================
-//	DSPタスク本体
+//	Core 1から1ブロックずつ呼ばれるDSP本体
 //==================================================================
-static void dsp_task(void *arg)
+void dsp_update(void)
 {
 	static uint16_t raw[DSP_HOP];
-	uint8_t spec_div = 0;
-	uint16_t col_acc_q8 = 0;
-	int16_t col_mn = 32767, col_mx = -32768;
-	uint16_t col_m1 = 0, col_m2 = 0;
-	uint8_t col_gate_cnt = 0;
-	uint8_t col_hops = 0;
+	static uint8_t spec_div = 0;
+	static uint16_t col_acc_q8 = 0;
+	static int16_t col_mn = 32767, col_mx = -32768;
+	static uint16_t col_m1 = 0, col_m2 = 0;
+	static uint8_t col_gate_cnt = 0;
+	static uint8_t col_hops = 0;
 #if DSP_DIAG
-	uint32_t diag_last_ms = millis();
+	static uint32_t diag_last_ms = millis();
 #endif
 
-	for (;;) {
-		size_t got = audio_read(raw, DSP_HOP);
-		if (got == 0) continue;
+	size_t got = audio_read(raw, DSP_HOP);
+	if (got == 0) return;
+	digitalWrite(PIN_TEST_OUT, HIGH);
 
 		int16_t mn = 32767, mx = -32768;
 		for (size_t i = 0; i < got; i++) {
@@ -401,7 +425,9 @@ static void dsp_task(void *arg)
 			if (s > mx) mx = s;
 		}
 
-		int32_t mag = process_gate();
+	mutex_enter_blocking(&tone_mux);
+	int32_t mag = process_gate();
+	mutex_exit(&tone_mux);
 		uint16_t mag16 = (mag > 65535) ? 65535 : (uint16_t)((mag < 0) ? 0 : mag);
 
 		// ゲート窓長のWPM追従 (ヒステリシス付き)。切替時はサイドEMAを
@@ -435,7 +461,7 @@ static void dsp_task(void *arg)
 		col_acc_q8 += 256;
 		if (col_acc_q8 >= scope_period_q8) {
 			col_acc_q8 -= scope_period_q8;
-			taskENTER_CRITICAL(&dsp_mux);
+			mutex_enter_blocking(&dsp_mux);
 			scope_col_t *col = &scope_ring[scope_pos];
 			col->mn = col_mn;
 			col->mx = col_mx;
@@ -446,7 +472,7 @@ static void dsp_task(void *arg)
 			// 飲み込まれ符号パターンに見えなくなる
 			col->gate = ((uint16_t)col_gate_cnt * 2 >= col_hops) ? 1 : 0;
 			scope_pos = (uint16_t)((scope_pos + 1) % SCOPE_RING_SIZE);
-			taskEXIT_CRITICAL(&dsp_mux);
+			mutex_exit(&dsp_mux);
 			col_mn = 32767;
 			col_mx = -32768;
 			col_m1 = 0;
@@ -466,7 +492,9 @@ static void dsp_task(void *arg)
 
 		if (++spec_div >= SPEC_INTERVAL_HOPS) {
 			spec_div = 0;
+			mutex_enter_blocking(&tone_mux);
 			process_spectrum();
+			mutex_exit(&tone_mux);
 		}
 
 #if DSP_DIAG
@@ -510,16 +538,19 @@ static void dsp_task(void *arg)
 			}
 		}
 #endif
-	}
+	digitalWrite(PIN_CW_LED, decoder_gate() ? HIGH : LOW);
+	digitalWrite(PIN_TEST_OUT, LOW);
 }
 
 void dsp_start(void)
 {
+	mutex_init(&dsp_mux);
+	mutex_init(&tone_mux);
 	gate_update_coeff();
 	for (int i = 0; i < DSP_SPEC_N; i++) {
 		hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(DSP_SPEC_N - 1)));
 	}
 	memset(scope_ring, 0, sizeof(scope_ring));
 	memset(spec_mag, 0, sizeof(spec_mag));
-	xTaskCreatePinnedToCore(dsp_task, "dsp", 8192, NULL, 3, NULL, 0);
+	__atomic_store_n(&dsp_ready, 1, __ATOMIC_RELEASE);
 }

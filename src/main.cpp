@@ -1,72 +1,93 @@
 ///////////////////////////////////////////////////////////////////////////
 //
-//	CW Decoder for ESP32 (air_monitor board)
-//	バージョン: 2.0
+//	CW Decoder for Raspberry Pi Pico 2 (RP2350)
+//	バージョン: 2.1
 //
-//	CH32V006 版 v1.9 からの移植:
-//	- Arduino + LovyanGFX (ST7789 240x320, 横向き 320x240)
-//	- トーン検出を Goertzel から FFT ベースに変更
-//	- 音声入力: GPIO35 (ADC1_CH7) を I2S DMA で 8kHz サンプリング
-//	  ※GPIO27(ADC2)は I2S 内蔵ADC非対応のため使用しない
-//	- 画面: 上2/3 デコード文字 (13列x6行, 24x24全角フォント/カタカナ対応)
+//	- Arduino-Pico + LovyanGFX (ST7789 240x320, 横向き 320x240)
+//	- 音声入力: GP26 / ADC0 を連結DMAで8kHzサンプリング
+//	- 画面: 上2/3 デコード文字 (16列x6行, 24x24全角フォント/カタカナ対応)
 //	        下1/3 左FFT / 右オシロ (生波形+エンベロープ+キー判定を同期表示)
-//	- 操作: タッチパネル (XPT2046)
-//	    ステータス行の US/JP バッジ    = 欧文/和文モード切替
-//	    ステータス行の TONE 表示       = AUTO→600→700→800→900→1000 の順送り
-//	      (AUTO = 550〜1000Hz の最強信号へ自動同調。デフォルト)
-//	    FFT パネル内タップ             = タップ位置に最も近いトーンを手動選択
-//	  BOOTボタン(GPIO0) でも操作可: 短押し=トーン切替 / 長押し=モード切替
+//	- 操作: 5個のプッシュスイッチ (タッチパネルなし)
 //
 //	原作: Hjalmar Skovholm Hansen OZ1JHM (GPL)
 //	このソフトウェアは GNU General Public License (GPL) に基づき配布されています。
 //
 ///////////////////////////////////////////////////////////////////////////
 #include <Arduino.h>
-#include <Wire.h>
 #include "audio.h"
 #include "dsp.h"
 #include "decoder.h"
 #include "display.h"
+#include "board_config.h"
 
-// タッチ診断: 起動時にI2Cスキャン(静電容量式コントローラの検出用)を行い、
-// タッチ検出時は画面に赤ドット + シリアルへ座標を出力する
-#define TOUCH_DIAG 0
+#define FRAME_MS 33
+#define DEBOUNCE_MS 30
 
-#if TOUCH_DIAG
-// 静電容量式タッチ(CST820=0x15, FT6x36=0x38, GT911=0x5D/0x14 等)が
-// 載っていればここで見つかる。display_init() より前に呼ぶこと。
-static void probe_i2c_touch(void)
+// Arduino-Picoのsetup1()/loop1()用にCore 1へ独立8KBスタックを割り当てる。
+bool core1_separate_stack = true;
+static uint8_t system_ready = 0;
+
+typedef struct {
+	uint8_t pin;
+	uint8_t raw;
+	uint8_t stable;
+	uint32_t changed_ms;
+} button_t;
+
+static button_t buttons[] = {
+	{ PIN_SW_MODE,      HIGH, HIGH, 0 },
+	{ PIN_SW_TONE_NEXT, HIGH, HIGH, 0 },
+	{ PIN_SW_KEY,       HIGH, HIGH, 0 },
+	{ PIN_SW_ENV,       HIGH, HIGH, 0 },
+	{ PIN_SW_RAW,       HIGH, HIGH, 0 },
+};
+
+static void tone_next(void)
 {
-	Serial.println("[diag] I2C scan SDA=33 SCL=32 ...");
-	Wire.begin(33, 32);
-	int found = 0;
-	for (uint8_t addr = 1; addr < 127; addr++) {
-		Wire.beginTransmission(addr);
-		if (Wire.endTransmission() == 0) {
-			Serial.printf("[diag]   found device at 0x%02X\n", addr);
-			found++;
+	dsp_set_tone((uint8_t)((dsp_tone_index() + 1) %
+	                       (DSP_TONE_COUNT + 1)));
+}
+
+static void button_short_action(uint8_t index)
+{
+	switch (index) {
+	case 0: decoder_toggle_mode(); break;
+	case 1: tone_next(); break;
+	case 2: display_toggle_key(); break;
+	case 3: display_toggle_env(); break;
+	case 4: display_toggle_raw(); break;
+	}
+}
+
+static void poll_buttons(void)
+{
+	uint32_t now = millis();
+	for (uint8_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
+		button_t *b = &buttons[i];
+		uint8_t raw = (uint8_t)digitalRead(b->pin);
+		if (raw != b->raw) {
+			b->raw = raw;
+			b->changed_ms = now;
+		}
+		if (raw != b->stable && (now - b->changed_ms) >= DEBOUNCE_MS) {
+			b->stable = raw;
+			if (raw == HIGH) {
+				button_short_action(i);
+			}
 		}
 	}
-	if (found == 0) {
-		Serial.println("[diag]   no I2C device (capacitive touch not on 33/32)");
-	}
-	Wire.end();
 }
-#endif
-
-#define PIN_BUTTON 0
-#define LONG_PRESS_MS 800
-#define FRAME_MS 33
 
 void setup()
 {
 	Serial.begin(115200);
-	pinMode(PIN_BUTTON, INPUT_PULLUP);
-
-#if TOUCH_DIAG
-	delay(500);
-	probe_i2c_touch();
-#endif
+	for (uint8_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
+		pinMode(buttons[i].pin, INPUT_PULLUP);
+	}
+	pinMode(PIN_CW_LED, OUTPUT);
+	pinMode(PIN_TEST_OUT, OUTPUT);
+	digitalWrite(PIN_CW_LED, LOW);
+	digitalWrite(PIN_TEST_OUT, LOW);
 
 	display_init();
 	display_splash();
@@ -74,38 +95,26 @@ void setup()
 	decoder_init();
 	decoder_set_emit(display_enqueue);
 
-	audio_init();
-	dsp_start();
+	__atomic_store_n(&system_ready, 1, __ATOMIC_RELEASE);
 }
 
-static void poll_button(void)
+// Core 1: ADCとDSPを表示から分離して連続処理する。
+void setup1()
 {
-	static uint8_t pressed = 0;
-	static uint32_t press_ms = 0;
-	static uint8_t long_done = 0;
+	while (!__atomic_load_n(&system_ready, __ATOMIC_ACQUIRE)) delay(1);
+	dsp_start();
+	audio_init();
+}
 
-	uint8_t now = (digitalRead(PIN_BUTTON) == LOW);
-	if (now && !pressed) {
-		pressed = 1;
-		long_done = 0;
-		press_ms = millis();
-	} else if (now && pressed && !long_done) {
-		if ((millis() - press_ms) >= LONG_PRESS_MS) {
-			decoder_toggle_mode();
-			long_done = 1;
-		}
-	} else if (!now && pressed) {
-		pressed = 0;
-		if (!long_done && (millis() - press_ms) >= 30) {
-			dsp_set_tone((uint8_t)((dsp_tone_index() + 1) % (DSP_TONE_COUNT + 1)));
-		}
-	}
+void loop1()
+{
+	dsp_update();
 }
 
 void loop()
 {
 	uint32_t t0 = millis();
-	poll_button();
+	poll_buttons();
 	display_update();
 	uint32_t dt = millis() - t0;
 	if (dt < FRAME_MS) {

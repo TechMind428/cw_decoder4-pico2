@@ -22,6 +22,8 @@ typedef struct {
 #define DSP_GATE_WIN 96             // トーン判定Goertzel窓 (12ms、帯域83.3Hz)
 
 void dsp_start(void);
+// Process one 48-sample block. Call continuously from Pico core 1 loop1().
+void dsp_update(void);
 void dsp_set_tone(uint8_t idx);     // 0..4=手動 / DSP_TONE_AUTO=自動
 uint8_t dsp_tone_index(void);
 uint8_t dsp_tone_is_auto(void);
