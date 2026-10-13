@@ -167,9 +167,6 @@ Gitでは追跡しません。
 
 モールスデコーダ部分はHjalmar Skovholm Hansen（OZ1JHM）氏のArduino用
 CW Decoderを起源とし、GNU General Public License（GPL）が適用されます。
-参照できる元ソースと上流リポジトリにはGPLの版番号が明記されていないため、
-公開配布前に適用版を確認し、正式な`LICENSE`ファイルを追加してください。
-
 LovyanGFXはGPLではなく、主ライセンスは2条項BSD系です。依存ライブラリの詳細と
 同梱ライセンス文は[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)を参照してください。
 
