@@ -109,7 +109,7 @@ SW2の選択順は`AUTO → 600 → 700 → 800 → 900 → 1000Hz → AUTO`で�
 | 内蔵 | GP25 | CW状態LED |
 | 16 | GP12 | DSP処理タイミングTEST出力 |
 
-配線とAF入力回路は[`hardware/wiring/CW_配線図.pdf`](hardware/wiring/CW_%E9%85%8D%E7%B7%9A%E5%9B%B3.pdf)を参照してください。
+配線とAF入力回路は[`hardware/wiring/CW_Decoder_for_Pico配線図.pdf`](hardware/wiring/CW_Decoder_for_Pico%E9%85%8D%E7%B7%9A%E5%9B%B3.pdf)を参照してください。
 GP26は0〜3.3Vの範囲を超えないようにしてください。
 
 ## ビルドとPico 2への転送
