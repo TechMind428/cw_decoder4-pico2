@@ -85,13 +85,16 @@ SW2を押すたびに順方向へ移動します。これにより、ESP32版で
 | 16 | GP12 | DSP処理タイミングTEST出力 |
 
 配線の詳細とAF入力保護・バイアス回路は
-[`hardware/wiring/CW_配線図.pptx`](hardware/wiring/CW_%E9%85%8D%E7%B7%9A%E5%9B%B3.pptx)を参照してください。
+[`hardware/wiring/CW_Decoder_for_Pico配線図.pdf`](hardware/wiring/CW_Decoder_for_Pico%E9%85%8D%E7%B7%9A%E5%9B%B3.pdf)を参照してください。
 ADC入力電圧は0〜3.3Vの範囲を超えないようにしてください。
 
 ## ハードウェア資料
 
-- `hardware/wiring/`: 配線図とLCD寸法資料
+- `hardware/wiring/`: 公開用配線図PDF
 - `hardware/case/`: ケースの3MFデータとLCD機械寸法DXF
+
+編集用の`CW_配線図.pptx`と`LCDサイズ.pptx`はローカルだけに保存し、
+Gitでは追跡しません。
 
 元写真・動画と作業用の配線図コピーはリポジトリに含めません。
 
